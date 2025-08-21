@@ -1,13 +1,13 @@
 // src/main.rs
 /*
-=============================================================================
-Project : Live Translation Rust — finish speaking, instantly translated. Powered by Rust for speed.
-Author : Kukuh Tripamungkas Wicaksono (Kukuh TW)
-Email : kukuhtw@gmail.com
-WhatsApp : https://wa.me/628129893706
-LinkedIn : https://id.linkedin.com/in/kukuhtw
-=============================================================================/
+cd /rust/livetranslation
 
+Set env (PowerShell):
+$env:RUST_LOG="info,tower_http=info,axum=info"
+$env:OPENAI_API_KEY="sk-..."
+$env:REALTIME_MODEL="gpt-4o-realtime-preview"
+$env:BASE_URL="http://localhost:8080"
+$env:PORT="8080"
 */
 
 use std::{
@@ -81,6 +81,8 @@ struct AppState {
     base_url: String,
     api_key: String,
     model: String,
+    target_hz: usize,
+    batch_ms: usize,
 }
 
 #[allow(dead_code)]
@@ -119,17 +121,24 @@ tracing::info!("tracing initialized ✅");
     let base_url = env::var("BASE_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
     let port: u16 = env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
 
+    let target_hz: usize = env::var("MIC_TARGET_HZ").ok().and_then(|s| s.parse().ok()).unwrap_or(24000);
+   let batch_ms: usize = env::var("MIC_BATCH_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+   let batch_ms = batch_ms.max(100); // minimal 100 ms
+
     let state = AppState {
         rooms: Arc::new(DashMap::new()),
         base_url,
         api_key,
         model,
+         target_hz,
+        batch_ms,
     };
 
     let app = Router::new()
         .route("/", get(|| async { Html(include_str!("../static/index.html")) }))
         .route("/view", get(|| async { Html(include_str!("../static/view.html")) }))
         .route("/api/room", post(create_room))
+        .route("/config", get(config)) 
         .route("/sse/:room", get(sse_room))
         .route("/ws/:room", get(ws_speaker))
         .nest_service("/static", ServeDir::new("static"))
@@ -145,6 +154,15 @@ tracing::info!("tracing initialized ✅");
     axum::serve(listener, app).await?;
     Ok(())
 }
+
+async fn config(State(state): State<AppState>) -> impl IntoResponse {
+    let body = serde_json::json!({
+        "targetHz": state.target_hz,
+        "batchMs": state.batch_ms
+    });
+    (StatusCode::OK, axum::Json(body))
+}
+
 
 async fn create_room(
     State(state): State<AppState>,
@@ -235,6 +253,10 @@ fn instructions_for(pair: &str, name: &str) -> (&'static str, String) {
         // Russian
         "id-ru" => ("id", json_instr("Indonesian", "Русский", name)),
         "ru-id" => ("ru", json_instr("Русский", "Indonesian", name)),
+
+            // NEW: Mandarin / Chinese
+        "id-zh" => ("id", json_instr("Indonesian", "中文", name)),
+        "zh-id" => ("zh", json_instr("中文", "Indonesian", name)),
 
         // Spanish
         "id-es" => ("id", json_instr("Indonesian", "Español", name)),
@@ -397,6 +419,7 @@ info!("🔎 Response headers: {:?}", rh);
     // Writer: receive from browser & forward to OpenAI
     let (mut ws_tx, mut ws_rx) = socket.split();
     let mut inited = false;
+    let sample_rate: usize = state.target_hz;  // <-- dari .env
     let mut audio_buffer_size: usize = 0;
 
     while let Some(Ok(msg)) = ws_rx.next().await {
@@ -434,16 +457,17 @@ info!("🔎 Response headers: {:?}", rh);
     tokio::time::sleep(Duration::from_millis(100)).await;
     
                             // Hitung durasi audio berdasarkan sample rate (default 24kHz)
-    const SAMPLE_RATE: usize = 24000; // Hz
-    const BYTES_PER_SAMPLE: usize = 2; // PCM16 = 2 bytes per sample
+    let sr = sample_rate;
+    const BYTES_PER_SAMPLE: usize = 2; // PCM16
     const MIN_DURATION_MS: usize = 100; // minimal 100ms
     
-    let min_samples = (SAMPLE_RATE * MIN_DURATION_MS) / 1000;
+   
+    let min_samples = (sr * MIN_DURATION_MS) / 1000;
     let min_bytes = min_samples * BYTES_PER_SAMPLE;
     
     if audio_buffer_size < min_bytes {
         info!("skip commit: buffer has {}ms (need {}ms)", 
-              (audio_buffer_size * 1000) / (SAMPLE_RATE * BYTES_PER_SAMPLE),
+             (audio_buffer_size * 1000) / (sr * BYTES_PER_SAMPLE),
               MIN_DURATION_MS);
         continue;
     }
@@ -493,10 +517,9 @@ info!("🔎 Response headers: {:?}", rh);
                 if !inited { continue; }
 
                 audio_buffer_size += bin.len();
-                 info!("Audio buffer: {} bytes ({}ms)", 
-          audio_buffer_size,
-          (audio_buffer_size * 1000) / (24000 * 2)); // 24kHz, PCM16
-
+                info!("Audio buffer: {} bytes ({}ms)",
+                     audio_buffer_size,
+                    (audio_buffer_size * 1000) / (sample_rate * 2));
 
                 let audio_b64 = base64::engine::general_purpose::STANDARD.encode(&bin);
                 let pkg = json!({ "type":"input_audio_buffer.append", "audio": audio_b64 });

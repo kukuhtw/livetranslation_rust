@@ -35,6 +35,10 @@
   <option value="id-ar">Indonesia → العربية</option>
   <option value="ar-id">العربية → Indonesia</option>
 
+   <!-- Mandarin / Chinese -->
+  <option value="id-zh">Indonesia → 中文</option>
+  <option value="zh-id">中文 → Indonesia</option>
+
   <option value="id-de">Indonesia → Deutsch</option>
   <option value="de-id">Deutsch → Indonesia</option>
 
@@ -76,6 +80,9 @@
     <pre id="log"></pre>
   </details>
 
+
+
+
 <script>
   let room = null;
   let ws = null;
@@ -95,9 +102,28 @@
   let lastCommitAt = 0;
   let watchdog = null;
 
-  const MIN_COMMIT_BYTES = 4800;            // ~100ms @ 24kHz PCM16 mono
+  // === NEW: config dinamis (fallback kalau /config tak ada) ===
+  const BYTES_PER_SAMPLE = 2;
+  const COMMIT_MS_MIN = 100; // syarat server: >=100ms
+  let CFG = { targetHz: 24000, batchMs: 120 };
+  let MIN_COMMIT_BYTES = Math.round(CFG.targetHz * COMMIT_MS_MIN / 1000) * BYTES_PER_SAMPLE;
 
-  // simple VAD (RMS threshold)
+  async function loadConfig() {
+    try {
+      const r = await fetch("/config", { cache: "no-store" });
+      if (!r.ok) throw new Error("config http " + r.status);
+      const c = await r.json();
+      if (![16000, 24000, 48000].includes(c.targetHz)) c.targetHz = 24000;
+      c.batchMs = Math.max(100, +c.batchMs || 120);
+      CFG = c;
+      // Sambil nunggu worklet kirim 'config', set threshold awal berdasar target ENV
+      MIN_COMMIT_BYTES = Math.round(CFG.targetHz * COMMIT_MS_MIN / 1000) * BYTES_PER_SAMPLE;
+      dlog("config", CFG, "MIN_COMMIT_BYTES", MIN_COMMIT_BYTES);
+    } catch (e) {
+      dlog("config fallback", e?.message || e);
+    }
+  }
+
   const VAD_THRESH = 300;
   let vadActive = false;
   let vadHangFrames = 0;
@@ -115,14 +141,14 @@
   const logEl = document.getElementById("log");
 
   pairSel.addEventListener("change", () => {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({
-      type: "init",
-      name: nameInput.value || "Speaker",
-      pair: pairSel.value
-    }));
-  }
-});
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "init",
+        name: nameInput.value || "Speaker",
+        pair: pairSel.value
+      }));
+    }
+  });
 
   function fmt(v){try{return typeof v==="object"?JSON.stringify(v):String(v)}catch{return String(v)}}
   function dlog(...args){
@@ -205,32 +231,38 @@
       } catch (err) { dlog("SSE parse error", err?.message || err); }
     };
 
-    // WS to our server
-    ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/${room}`);
-    btn.disabled = true;
-    ws.addEventListener("open", () => {
-      dlog("WS open");
-      const pair = pairSel.value;
-      const name = nameInput.value || "Speaker";
-      ws.send(JSON.stringify({ type: "init", name, pair }));
-      btn.disabled = false;
-      stateEl.textContent = "ws ready";
-    });
-    ws.addEventListener("close", (ev) => dlog("WS close", `code=${ev.code}`, `reason=${ev.reason}`));
-    ws.addEventListener("error", (err) => dlog("WS error", err?.message || "unknown"));
-    ws.addEventListener("message", (ev) => {
-      try {
-        const m = JSON.parse(ev.data);
-        if (m.error) {
-          dlog("WS upstream error:", m.error);
-          logLine("[upstream error] " + m.error, "final");
-        }
-      } catch {}
-    });
+
+    // WS ke server (wajib supaya audio terkirim)
+ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/${room}`);
+
+btn.disabled = true;
+ws.addEventListener("open", () => {
+  dlog("WS open");
+  const pair = pairSel.value;
+  const name = nameInput.value || "Speaker";
+  ws.send(JSON.stringify({ type: "init", name, pair }));
+  btn.disabled = false;
+  stateEl.textContent = "ws ready";
+});
+
+ws.addEventListener("close", (ev) => dlog("WS close", `code=${ev.code}`, `reason=${ev.reason}`));
+ws.addEventListener("error", (err) => dlog("WS error", err?.message || "unknown"));
+ws.addEventListener("message", (ev) => {
+  try {
+    const m = JSON.parse(ev.data);
+    if (m.error) {
+      dlog("WS upstream error:", m.error);
+      logLine("[upstream error] " + m.error, "final");
+    }
+  } catch {}
+});
+
   }
 
   async function startAudio() {
     stateEl.textContent = "requesting mic…";
+    await loadConfig();
+
     dlog("getUserMedia…");
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -245,47 +277,76 @@
 
     audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
     dlog("AudioContext @", audioCtx.sampleRate, "Hz");
-    await audioCtx.audioWorklet.addModule("/static/pcm-worklet.js");
-    dlog("worklet loaded");
+   
+   
+    await audioCtx.audioWorklet.addModule("/static/pcm-worklet.js?v=2"); // cache-buster
+
+
     await audioCtx.resume();
 
     const source = audioCtx.createMediaStreamSource(mediaStream);
-    workletNode = new AudioWorkletNode(audioCtx, "pcm16-downsampler");
 
+    // === pakai selectable + target dari config ===
+    workletNode = new AudioWorkletNode(audioCtx, "pcm16-selectable", {
+     numberOfInputs: 1,
+   numberOfOutputs: 1,         // <-- beri 1 output
+  outputChannelCount: [1],    // mono keluar (silent)
+  channelCount: 1,            // input mono
+  channelCountMode: "explicit",
+    processorOptions: { targetHz: CFG.targetHz, batchMs: CFG.batchMs }
+  });
+
+    // === UPDATED: tangani pesan object dari worklet ===
     workletNode.port.onmessage = (e) => {
-      const buf = new Uint8Array(e.data);
-      const view = new Int16Array(e.data);
+      const msg = e.data || {};
+
+      if (msg.type === "config") {
+        // sesuaikan commit threshold ke outHz aktual dari worklet
+        MIN_COMMIT_BYTES = Math.round(msg.outHz * COMMIT_MS_MIN / 1000) * BYTES_PER_SAMPLE;
+        dlog("worklet config", msg, "MIN_COMMIT_BYTES", MIN_COMMIT_BYTES);
+        return;
+      }
+      if (msg.type === "warn") {
+        dlog("worklet warn", msg.message || "");
+        return;
+      }
+      if (msg.type !== "pcm" || !msg.pcm) return;
+
+      // Hanya kirim bagian valid (samples * 2 byte)
+      const u8 = new Uint8Array(msg.pcm, 0, msg.samples * BYTES_PER_SAMPLE);
+      const i16 = new Int16Array(msg.pcm, 0, msg.samples);
 
       // VAD RMS
-      let sum = 0; 
-      for (let i = 0; i < view.length; i++) { const s = view[i]; sum += s * s; }
-      const rms = Math.sqrt(sum / Math.max(1, view.length));
+      let sum = 0;
+      for (let i = 0; i < i16.length; i++) { const s = i16[i]; sum += s * s; }
+      const rms = Math.sqrt(sum / Math.max(1, i16.length));
 
-      if (rms >= VAD_THRESH) { 
-        vadActive = true; 
-        vadHangFrames = VAD_HANG; 
-      } else if (vadHangFrames > 0) { 
-        vadHangFrames--; 
-        vadActive = true; 
-      } else { 
-        vadActive = false; 
+      if (rms >= VAD_THRESH) {
+        vadActive = true;
+        vadHangFrames = VAD_HANG;
+      } else if (vadHangFrames > 0) {
+        vadHangFrames--;
+        vadActive = true;
+      } else {
+        vadActive = false;
       }
 
       // Kirim hanya saat aktif bicara
       if (ws && ws.readyState === WebSocket.OPEN && vadActive) {
-        ws.send(buf); // kirim binary sekali saja
-        const bytes = buf.byteLength || 0;
-        chunksSent++; 
-        bytesSent += bytes; 
+        ws.send(u8);
+        const bytes = u8.byteLength || 0;
+        chunksSent++;
+        bytesSent += bytes;
         bytesSinceCommit += bytes;
         if (chunksSent % 20 === 0) dlog("audio chunk", `${bytes}B`, `total=${(bytesSent/1024).toFixed(1)}KB`, `rms=${rms|0}`);
       }
     };
 
     // mute to avoid echo
-    const mute = audioCtx.createGain(); 
+    const mute = audioCtx.createGain();
     mute.gain.value = 0;
-    source.connect(workletNode).connect(mute).connect(audioCtx.destination);
+    source.connect(workletNode);
+    workletNode.connect(mute).connect(audioCtx.destination);
 
     // reset counters
     bytesSinceCommit = 0;
@@ -331,6 +392,9 @@
     dlog("recording OFF");
   }
 
+  function renderStatsLoop(){renderStats()}
+  setInterval(renderStatsLoop, 400);
+
   btn.addEventListener("click", async () => {
     if (!room) return;
     if (!speaking) {
@@ -345,10 +409,16 @@
     }
   });
 
-  createRoom().catch((err) => {
-    dlog("createRoom failed", err?.message || err);
-    logLine("Gagal membuat room: " + err, "final");
-  });
+  async function init() {
+    await loadConfig();
+    createRoom().catch((err) => {
+      dlog("createRoom failed", err?.message || err);
+      logLine("Gagal membuat room: " + err, "final");
+    });
+  }
+
+  init();
 </script>
+
 </body>
 </html>
