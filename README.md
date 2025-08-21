@@ -7,6 +7,7 @@ Built with Rust for steady low latency. Powered by GPT-5 for context-aware accur
   <em>Indonesian → 日本語 on the fly • Q&A in Deutsch • Recap in English • One click to 한국어 • Also: العربية, Français, Nederlands, Русский, Español</em>
 </p>
 
+https://www.youtube.com/watch?v=0PVihxcbK1g
 ---
 
 ## ✨ What this project does
