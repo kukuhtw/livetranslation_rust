@@ -183,4 +183,13 @@ Please:
 > Rust for speed and stability. GPT-5 for accuracy and tone.
 > Perfect for conferences, onboarding, classrooms, and cross-country teams.
 
----
+--- ---
+
+## 👤 Author
+
+**Kukuh Tripamungkas Wicaksono (Kukuh TW)**
+📧 **[kukuhtw@gmail.com](mailto:kukuhtw@gmail.com)** · 📱 **[https://wa.me/628129893706](https://wa.me/628129893706)**
+🔗 **LinkedIn:** [https://id.linkedin.com/in/kukuhtw](https://id.linkedin.com/in/kukuhtw)
+
+
+
