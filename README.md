@@ -1,4 +1,4 @@
-# Live Translation (Rust + GPT-5)
+# Live Translation (Rust + GPT OpenAI)
 
 **Finish speaking → instantly translated.**
 Built with Rust for steady low latency. Powered by GPT-5 for context-aware accuracy.
@@ -83,16 +83,10 @@ No device juggling. No awkward “start/stop”.
 Create a `.env` in project root:
 
 ```bash
-OPENAI_API_KEY=sk-...
-# Comma-separated targets; change on UI anytime
-TARGET_LANGS=ja,de,en,ko,ar,fr,nl,ru,es
-# Default assumed spoken language (used for ASR hints)
-SOURCE_LANG=id
-# Optional model names if you have specific variants
-ASR_MODEL=gpt-5-transcribe
-MT_MODEL=gpt-5-translate
-# Server
-BIND_ADDR=0.0.0.0:8787
+OPENAI_API_KEY=sk-
+REALTIME_MODEL=gpt-4o-realtime-preview
+BASE_URL=http://localhost:8080
+PORT=8080
 ```
 
 ### 2) Run the server
@@ -101,11 +95,11 @@ BIND_ADDR=0.0.0.0:8787
 cargo run --release
 ```
 
-Server starts at `http://localhost:8787`.
+Server starts at `http://localhost:8080`.
 
 ### 3) Open the demo web UI
 
-* Visit `http://localhost:8787/`
+* Visit `http://localhost:8080/`
 * Allow microphone access
 * Choose target languages; start speaking Indonesian
 * Watch captions appear at the end of each utterance
@@ -130,77 +124,9 @@ Server starts at `http://localhost:8787`.
 
 ## 🧪 Local Test (CLI)
 
-You can also test with a WAV file:
-
-```bash
-cargo run --release -- \
-  --wav ./samples/indonesian_short.wav \
-  --targets ja,en
-```
 
 The program will print the recognized Indonesian text and the translations.
 
----
-
-## 🌐 Minimal Web Client (snippet)
-
-```html
-<script>
-(async () => {
-  const ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.binaryType = "arraybuffer";
-
-  // Send control message (select targets)
-  ws.onopen = () => ws.send(JSON.stringify({
-    type: "control",
-    targets: ["ja","en","de"],
-    source: "id",
-    glossary: [] // optional domain terms
-  }));
-
-  // Receive captions
-  ws.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data);
-    if (msg.type === "caption") {
-      // { utterance_id, source_text, translations: {ja:"...",en:"..."} }
-      renderCaption(msg);
-    }
-  };
-
-  // Capture mic
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  const ctx = new AudioContext();
-  const src = ctx.createMediaStreamSource(stream);
-  const proc = ctx.createScriptProcessor(4096, 1, 1);
-  src.connect(proc); proc.connect(ctx.destination);
-  proc.onaudioprocess = (e) => {
-    const pcm = e.inputBuffer.getChannelData(0);
-    // Float32 [-1,1] → Int16 PCM
-    const buf = new Int16Array(pcm.length);
-    for (let i = 0; i < pcm.length; i++) buf[i] = Math.max(-1, Math.min(1, pcm[i])) * 0x7fff;
-    ws.send(buf.buffer);
-  };
-})();
-</script>
-```
-
-> In production you’ll likely use `AudioWorklet`, sequence numbers, and back-pressure.
-
----
-
-## ⚙️ Configuration
-
-| Key              | Meaning                                | Default            |
-| ---------------- | -------------------------------------- | ------------------ |
-| `TARGET_LANGS`   | Comma list of ISO codes (ja,de,en,...) | `ja,de,en,ko`      |
-| `SOURCE_LANG`    | Hint for ASR source language           | `id`               |
-| `ASR_MODEL`      | ASR model id                           | `gpt-5-transcribe` |
-| `MT_MODEL`       | Translation model id                   | `gpt-5-translate`  |
-| `BIND_ADDR`      | Server bind address                    | `0.0.0.0:8787`     |
-| `MAX_UTTER_MS`   | Utterance hard cap (ms)                | `6000`             |
-| `MIN_SILENCE_MS` | Silence to close utterance (ms)        | `300`              |
-
----
 
 ## 💸 Costs & Limits
 

@@ -1,0 +1,10 @@
+/*
+=============================================================================
+Project : Live Translation Rust — finish speaking, instantly translated. Powered by Rust for speed.
+Author : Kukuh Tripamungkas Wicaksono (Kukuh TW)
+Email : kukuhtw@gmail.com
+WhatsApp : https://wa.me/628129893706
+LinkedIn : https://id.linkedin.com/in/kukuhtw
+=============================================================================/
+
+*/

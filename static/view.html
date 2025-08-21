@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Live Translate (Viewer)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; max-width: 800px; margin: 24px auto; }
+    #out { white-space: pre-wrap; border: 1px solid #ddd; padding: 12px; border-radius: 8px; min-height: 120px; }
+    .final { font-weight: 600; }
+    .muted { color:#666; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h2>Live Translate (Viewer)</h2>
+  <div class="muted" id="info">connecting…</div>
+  <div id="out"></div>
+
+<script>
+  const out = document.getElementById("out");
+  const info = document.getElementById("info");
+  const params = new URLSearchParams(location.search);
+  const room = params.get("room");
+
+  if (!room) {
+    info.textContent = "missing ?room=…";
+  } else {
+    const es = new EventSource(`/sse/${room}`);
+    es.onopen = () => info.textContent = "connected";
+    es.onerror = () => info.textContent = "disconnected";
+    es.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === "partial") {
+          const last = out.lastElementChild;
+          if (last && !last.classList.contains("final")) last.textContent = msg.text;
+          else {
+            const d = document.createElement("div");
+            d.textContent = msg.text;
+            out.appendChild(d);
+          }
+        } else if (msg.type === "final") {
+          const d = document.createElement("div");
+          d.className = "final";
+          try {
+            const obj = JSON.parse(msg.text);
+            d.innerHTML = `<div>${obj.src}</div><div style="font-weight:700">${obj.tgt}</div>`;
+          } catch {
+            d.textContent = msg.text;
+          }
+          out.appendChild(d);
+        }
+      } catch {}
+      out.scrollTop = out.scrollHeight;
+    };
+  }
+</script>
+</body>
+</html>

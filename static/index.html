@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Live Translate (Speaker)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; max-width: 900px; margin: 24px auto; }
+    button { padding: 10px 16px; font-size: 16px; }
+    #out { white-space: pre-wrap; border: 1px solid #ddd; padding: 12px; border-radius: 8px; min-height: 100px; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    label { font-weight: 600; }
+    select, input { font-size: 16px; padding: 6px 8px; }
+    .muted { color: #666; font-size: 14px; }
+    .final { font-weight: 600; }
+    details { margin-top: 16px; }
+    #log { height: 220px; overflow:auto; background:#0b1020; color:#e8f0ff; padding:10px; border-radius:8px; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; }
+    .stat { display:inline-block; margin-right:10px; }
+  </style>
+</head>
+<body>
+  <h1>Live Translate (Speaker)</h1>
+
+  <div class="row">
+    <label for="pair">Language Pair</label>
+    <select id="pair">
+  <option value="id-en">Indonesia → English</option>
+  <option value="en-id">English → Indonesia</option>
+  <option value="id-ja">Indonesia → 日本語</option>
+  <option value="ja-id">日本語 → Indonesia</option>
+
+  <option value="id-ko">Indonesia → 한국어</option>
+  <option value="ko-id">한국어 → Indonesia</option>
+
+  <option value="id-ar">Indonesia → العربية</option>
+  <option value="ar-id">العربية → Indonesia</option>
+
+  <option value="id-de">Indonesia → Deutsch</option>
+  <option value="de-id">Deutsch → Indonesia</option>
+
+  <option value="id-fr">Indonesia → Français</option>
+  <option value="fr-id">Français → Indonesia</option>
+
+  <option value="id-nl">Indonesia → Nederlands</option>
+  <option value="nl-id">Nederlands → Indonesia</option>
+
+  <option value="id-ru">Indonesia → Русский</option>
+  <option value="ru-id">Русский → Indonesia</option>
+
+  <option value="id-es">Indonesia → Español</option>
+  <option value="es-id">Español → Indonesia</option>
+</select>
+
+
+    <label for="name">Name</label>
+    <input id="name" placeholder="Nama kamu" value="Speaker" />
+  </div>
+
+  <p class="muted">Share link viewer: <a id="share" href="#" target="_blank">(menunggu room…)</a></p>
+
+  <div class="row">
+    <button id="btn">🎙️ Start Speak</button>
+    <span id="state" class="muted">idle</span>
+  </div>
+
+  <h3>Output</h3>
+  <div id="out"></div>
+
+  <details open>
+    <summary><strong>Debug</strong></summary>
+    <div class="muted" style="margin:6px 0 8px;">
+      <span id="wsStat" class="stat">WS:-</span>
+      <span id="sseStat" class="stat">SSE:-</span>
+      <span id="micStat" class="stat">Mic:-</span>
+    </div>
+    <pre id="log"></pre>
+  </details>
+
+<script>
+  let room = null;
+  let ws = null;
+  let es = null;
+  let audioCtx = null;
+  let workletNode = null;
+  let mediaStream = null;
+  let speaking = false;
+  let commitTimer = null;
+
+  // trackers
+  let esState = "-";
+  let chunksSent = 0;
+  let bytesSent = 0;
+  let bytesSinceCommit = 0;
+  let commitsSent = 0;
+  let lastCommitAt = 0;
+  let watchdog = null;
+
+  const MIN_COMMIT_BYTES = 4800;            // ~100ms @ 24kHz PCM16 mono
+
+  // simple VAD (RMS threshold)
+  const VAD_THRESH = 300;
+  let vadActive = false;
+  let vadHangFrames = 0;
+  const VAD_HANG = 6;
+
+  const out = document.getElementById("out");
+  const btn = document.getElementById("btn");
+  const stateEl = document.getElementById("state");
+  const shareA = document.getElementById("share");
+  const pairSel = document.getElementById("pair");
+  const nameInput = document.getElementById("name");
+  const wsStat = document.getElementById("wsStat");
+  const sseStat = document.getElementById("sseStat");
+  const micStat = document.getElementById("micStat");
+  const logEl = document.getElementById("log");
+
+  pairSel.addEventListener("change", () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      type: "init",
+      name: nameInput.value || "Speaker",
+      pair: pairSel.value
+    }));
+  }
+});
+
+  function fmt(v){try{return typeof v==="object"?JSON.stringify(v):String(v)}catch{return String(v)}}
+  function dlog(...args){
+    const t=new Date().toLocaleTimeString("en-GB",{hour12:false});
+    logEl.textContent+=`[${t}] ${args.map(fmt).join(" ")}\n`;
+    if(logEl.textContent.length>120000)logEl.textContent=logEl.textContent.slice(-80000);
+    logEl.scrollTop=logEl.scrollHeight
+  }
+
+  function logLine(txt, cls) {
+    const p = document.createElement("div");
+    if (cls) p.className = cls;
+    p.textContent = txt;
+    out.appendChild(p);
+    out.scrollTop = out.scrollHeight;
+  }
+  function renderPair(srcText, tgtText) {
+    const last = out.lastElementChild;
+    if (last && !last.classList.contains("final")) out.removeChild(last);
+    const wrap = document.createElement("div"); wrap.className = "final";
+    const line1 = document.createElement("div"); line1.textContent = srcText;
+    const line2 = document.createElement("div"); line2.style.fontWeight = "700"; line2.textContent = tgtText;
+    wrap.appendChild(line1); wrap.appendChild(line2);
+    out.appendChild(wrap);
+    out.scrollTop = out.scrollHeight;
+  }
+
+  function renderStats() {
+    const wsMap = ["CONNECTING", "OPEN", "CLOSING", "CLOSED"];
+    wsStat.textContent = `WS:${ws ? wsMap[ws.readyState] : "-"}`;
+    sseStat.textContent = `SSE:${esState}`;
+    const kb = (bytesSent / 1024).toFixed(1);
+    const since = lastCommitAt ? (((Date.now() - lastCommitAt) / 1000).toFixed(1) + "s") : "-";
+    micStat.textContent = `Mic:${speaking ? "on" : "off"}  chunks:${chunksSent}  bytes:${kb}KB  commits:${commitsSent} (last ${since})`;
+  }
+  setInterval(renderStats, 400);
+
+  function armWatchdog(){clearWatchdog();watchdog=setTimeout(()=>{logLine("⚠️ Delay: tidak ada respons dari model (>2s).","final");dlog("watchdog timeout");},2000)}
+  function clearWatchdog(){if(watchdog){clearTimeout(watchdog);watchdog=null}}
+
+  async function createRoom() {
+    dlog("POST /api/room …");
+    const resp = await fetch("/api/room", { method:"POST", headers:{ "content-type":"application/json" }, body: JSON.stringify({}) });
+    const data = await resp.json();
+    room = data.room_id;
+    shareA.textContent = data.share_url;
+    shareA.href = data.share_url;
+    dlog("room created", room, "share:", data.share_url);
+
+    // SSE subscribe
+    es = new EventSource(`/sse/${room}`);
+    esState = "connecting";
+    es.onopen  = () => { esState = "open";  dlog("SSE open"); };
+    es.onerror = (e) => { esState = "error"; dlog("SSE error", e?.message || ""); };
+    es.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === "partial") {
+          clearWatchdog();
+          stateEl.textContent = "receiving…";
+          const last = out.lastElementChild;
+          if (last && !last.classList.contains("final")) last.textContent = msg.text;
+          else logLine(msg.text);
+        } else if (msg.type === "final") {
+          clearWatchdog();
+          stateEl.textContent = speaking ? "recording" : "idle";
+          try {
+            const obj = JSON.parse(msg.text);
+            if (obj && typeof obj === "object" && "src" in obj && "tgt" in obj) {
+              renderPair(obj.src, obj.tgt);
+            } else {
+              logLine(msg.text, "final");
+            }
+          } catch { logLine(msg.text, "final"); }
+        } else if (msg.type === "error") {
+          clearWatchdog();
+          logLine("[error] " + JSON.stringify(msg.data), "final");
+          dlog("SSE payload error", msg.data);
+        }
+      } catch (err) { dlog("SSE parse error", err?.message || err); }
+    };
+
+    // WS to our server
+    ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/${room}`);
+    btn.disabled = true;
+    ws.addEventListener("open", () => {
+      dlog("WS open");
+      const pair = pairSel.value;
+      const name = nameInput.value || "Speaker";
+      ws.send(JSON.stringify({ type: "init", name, pair }));
+      btn.disabled = false;
+      stateEl.textContent = "ws ready";
+    });
+    ws.addEventListener("close", (ev) => dlog("WS close", `code=${ev.code}`, `reason=${ev.reason}`));
+    ws.addEventListener("error", (err) => dlog("WS error", err?.message || "unknown"));
+    ws.addEventListener("message", (ev) => {
+      try {
+        const m = JSON.parse(ev.data);
+        if (m.error) {
+          dlog("WS upstream error:", m.error);
+          logLine("[upstream error] " + m.error, "final");
+        }
+      } catch {}
+    });
+  }
+
+  async function startAudio() {
+    stateEl.textContent = "requesting mic…";
+    dlog("getUserMedia…");
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        sampleRate: 48000,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: false
+      },
+      video: false
+    });
+
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+    dlog("AudioContext @", audioCtx.sampleRate, "Hz");
+    await audioCtx.audioWorklet.addModule("/static/pcm-worklet.js");
+    dlog("worklet loaded");
+    await audioCtx.resume();
+
+    const source = audioCtx.createMediaStreamSource(mediaStream);
+    workletNode = new AudioWorkletNode(audioCtx, "pcm16-downsampler");
+
+    workletNode.port.onmessage = (e) => {
+      const buf = new Uint8Array(e.data);
+      const view = new Int16Array(e.data);
+
+      // VAD RMS
+      let sum = 0; 
+      for (let i = 0; i < view.length; i++) { const s = view[i]; sum += s * s; }
+      const rms = Math.sqrt(sum / Math.max(1, view.length));
+
+      if (rms >= VAD_THRESH) { 
+        vadActive = true; 
+        vadHangFrames = VAD_HANG; 
+      } else if (vadHangFrames > 0) { 
+        vadHangFrames--; 
+        vadActive = true; 
+      } else { 
+        vadActive = false; 
+      }
+
+      // Kirim hanya saat aktif bicara
+      if (ws && ws.readyState === WebSocket.OPEN && vadActive) {
+        ws.send(buf); // kirim binary sekali saja
+        const bytes = buf.byteLength || 0;
+        chunksSent++; 
+        bytesSent += bytes; 
+        bytesSinceCommit += bytes;
+        if (chunksSent % 20 === 0) dlog("audio chunk", `${bytes}B`, `total=${(bytesSent/1024).toFixed(1)}KB`, `rms=${rms|0}`);
+      }
+    };
+
+    // mute to avoid echo
+    const mute = audioCtx.createGain(); 
+    mute.gain.value = 0;
+    source.connect(workletNode).connect(mute).connect(audioCtx.destination);
+
+    // reset counters
+    bytesSinceCommit = 0;
+    commitsSent = 0;
+
+    // periodic commit only when ≥ ~100ms audio & user in pause
+    commitTimer = setInterval(() => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (vadActive) return;
+      if (bytesSinceCommit < MIN_COMMIT_BYTES) return;
+
+      dlog('client commit', `bytesSinceCommit=${bytesSinceCommit}`);
+      ws.send(JSON.stringify({ type: 'commit' }));
+      commitsSent++; lastCommitAt = Date.now();
+      bytesSinceCommit = 0;
+      armWatchdog();
+    }, 500);
+
+    speaking = true;
+    stateEl.textContent = "recording";
+    btn.textContent = "⏹ Stop";
+    dlog("recording ON");
+  }
+
+  function stopAudio() {
+    speaking = false;
+    stateEl.textContent = "idle";
+    btn.textContent = "🎙️ Start Speak";
+
+    if (commitTimer) { clearInterval(commitTimer); commitTimer = null; }
+    if (ws && ws.readyState === WebSocket.OPEN && bytesSinceCommit >= MIN_COMMIT_BYTES) {
+      ws.send(JSON.stringify({ type: "commit" }));
+      commitsSent++; lastCommitAt = Date.now();
+      dlog("final commit");
+      armWatchdog();
+    }
+    bytesSinceCommit = 0;
+    clearWatchdog();
+
+    try { workletNode && workletNode.disconnect(); } catch {}
+    try { audioCtx && audioCtx.close(); } catch {}
+    if (mediaStream) { for (const t of mediaStream.getTracks()) t.stop(); }
+    dlog("recording OFF");
+  }
+
+  btn.addEventListener("click", async () => {
+    if (!room) return;
+    if (!speaking) {
+      try { await startAudio(); }
+      catch (err) {
+        stateEl.textContent = "mic error";
+        dlog("mic error", err?.message || err);
+        logLine("[mic] " + (err && err.message ? err.message : err), "final");
+      }
+    } else {
+      stopAudio();
+    }
+  });
+
+  createRoom().catch((err) => {
+    dlog("createRoom failed", err?.message || err);
+    logLine("Gagal membuat room: " + err, "final");
+  });
+</script>
+</body>
+</html>
